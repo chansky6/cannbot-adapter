@@ -29,6 +29,14 @@
 - macOS: `cannbot-adapter_<version>_aarch64.dmg`（Apple Silicon）
 - Windows: `cannbot-adapter_<version>_x64_en-US.msi` 或 `_setup.exe`
 
+> **macOS 安装提示**：应用未经 Apple 开发者签名公证，从浏览器下载后首次打开可能提示「"cannbot-adapter"已损坏，无法打开」。这是 Gatekeeper 对未签名应用的拦截，并非文件真的损坏。安装后执行一次：
+>
+> ```bash
+> xattr -cr /Applications/cannbot-adapter.app
+> ```
+>
+> 即可正常打开（右键 → 打开也可绕过一次）。
+
 启动后，在配置页「上游凭据」中填入**个人 VK**（从公司/管理员处获取，`vk-` 开头）即完成接入，无需安装 opencode。认证流程：适配器用 VK 换取长效 JWT（约 100 年有效），随后自动发现账号下的内置 VK，auto 策略即可用。
 
 ### 客户端接入

@@ -40,6 +40,26 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Export Apple signing secrets
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Only export non-empty values: tauri-cli treats an empty-string
+          # APPLE_* env var as a real (invalid) credential and fails the build.
+          for var in APPLE_SIGNING_IDENTITY APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            value="${!var}"
+            if [ -n "$value" ]; then
+              echo "$var=$value" >> "$GITHUB_ENV"
+              echo "Exported $var"
+            fi
+          done
+
       - name: Build and upload release artifacts
         uses: tauri-apps/tauri-action@v0
         env:
