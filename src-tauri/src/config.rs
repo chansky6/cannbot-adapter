@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::secret;
+
 /// How the adapter picks the upstream virtual key (VK) for a request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +32,9 @@ pub struct AppConfig {
     /// The user's personal VK, obtained from the company. This is the only
     /// upstream credential the user needs to provide; the JWT is derived
     /// from it via `/api/auth/authenticate`.
+    ///
+    /// On disk this is stored AES-256-GCM encrypted (`enc:v1:…`, see
+    /// `secret.rs`). After `load_or_init` the in-memory value is plaintext.
     #[serde(default)]
     pub user_vk: Option<String>,
     /// Stable random device identifier (MAC-format) used for VK authentication.
@@ -108,13 +113,15 @@ impl AppConfig {
     }
 }
 
-pub fn config_file(app: &tauri::AppHandle) -> PathBuf {
+pub fn config_dir(app: &tauri::AppHandle) -> PathBuf {
     use tauri::Manager;
-    let dir = app
-        .path()
+    app.path()
         .app_config_dir()
-        .expect("app config dir unavailable");
-    dir.join("config.json")
+        .expect("app config dir unavailable")
+}
+
+pub fn config_file(app: &tauri::AppHandle) -> PathBuf {
+    config_dir(app).join("config.json")
 }
 
 pub fn generate_api_key() -> String {
@@ -140,8 +147,55 @@ pub fn load_or_init(app: &tauri::AppHandle) -> AppConfig {
     if path.exists() {
         if let Ok(text) = std::fs::read_to_string(&path) {
             match serde_json::from_str::<AppConfig>(&text) {
-                Ok(cfg) => {
+                Ok(mut cfg) => {
+                    // Decrypt secrets into memory; legacy plaintext values
+                    // pass through unchanged (they get encrypted on next save).
+                    // A decrypt failure keeps the stored ciphertext so the
+                    // value isn't silently lost — the user is told to re-enter
+                    // it, and the frontend shows an auth error anyway.
+                    let mut needs_reencrypt = false;
+                    let mut decrypt_failed = false;
+                    if let Some(vk) = cfg.user_vk.take() {
+                        match secret::decrypt(app, &vk) {
+                            Ok(plain) => {
+                                // Re-save whenever the stored form wasn't the
+                                // current nonce-prefixed format (plaintext or
+                                // legacy zero-nonce ciphertext): save_config
+                                // re-encrypts with a fresh random nonce.
+                                needs_reencrypt |= true;
+                                cfg.user_vk = Some(plain);
+                            }
+                            Err(e) => {
+                                decrypt_failed = true;
+                                tracing::error!(error = %e, "failed to decrypt user_vk; keep ciphertext, user must re-enter it");
+                                cfg.user_vk = Some(vk);
+                            }
+                        }
+                    }
+                    if let Some(mv) = cfg.manual_vk.take() {
+                        match secret::decrypt(app, &mv) {
+                            Ok(plain) => {
+                                needs_reencrypt |= true;
+                                cfg.manual_vk = Some(plain);
+                            }
+                            Err(e) => {
+                                decrypt_failed = true;
+                                tracing::error!(error = %e, "failed to decrypt manual_vk; keep ciphertext, user must re-enter it");
+                                cfg.manual_vk = Some(mv);
+                            }
+                        }
+                    }
                     tracing::info!(?path, "config loaded");
+                    if decrypt_failed {
+                        tracing::error!("VK 解密失败（.keyfile 可能丢失或损坏），请重新配置个人 VK");
+                    }
+                    // Persist with a fresh random nonce (also migrates legacy
+                    // plaintext / zero-nonce values to the current format).
+                    if needs_reencrypt {
+                        if let Err(e) = save_config(app, &cfg) {
+                            tracing::warn!(error = %e, "failed to re-encrypt secrets");
+                        }
+                    }
                     return cfg;
                 }
                 Err(e) => {
@@ -163,7 +217,16 @@ pub fn save_config(app: &tauri::AppHandle, cfg: &AppConfig) -> Result<(), String
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create config dir failed: {e}"))?;
     }
-    let text = serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize config: {e}"))?;
+    // Persist an encrypted copy; the in-memory config keeps plaintext.
+    let mut persisted = cfg.clone();
+    if let Some(vk) = persisted.user_vk.take() {
+        persisted.user_vk = Some(secret::encrypt(app, &vk)?);
+    }
+    if let Some(mv) = persisted.manual_vk.take() {
+        persisted.manual_vk = Some(secret::encrypt(app, &mv)?);
+    }
+    let text =
+        serde_json::to_string_pretty(&persisted).map_err(|e| format!("serialize config: {e}"))?;
     std::fs::write(&path, text).map_err(|e| format!("write config failed: {e}"))?;
     tracing::info!(?path, "config saved");
     Ok(())

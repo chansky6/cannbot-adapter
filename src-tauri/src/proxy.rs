@@ -9,12 +9,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tauri::Emitter;
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{ServerHandle, Shared};
-use crate::{jwt, upstream};
+use crate::{jwt, upstream, usage};
 
 /// Classifications of upstream failures that drive the VK fallback loop.
 pub enum UpstreamError {
@@ -40,7 +41,8 @@ impl UpstreamError {
 
 /// POST one chat request to the gateway with the given JWT + VK.
 /// On HTTP 200 the response is already converted to an axum `Response`
-/// (streaming body, both for SSE and plain JSON).
+/// (streaming body, both for SSE and plain JSON). The full body is buffered
+/// through so usage accounting can read the final token counts.
 pub async fn send_chat(
     shared: &Shared,
     jwt: &str,
@@ -62,7 +64,17 @@ pub async fn send_chat(
         .map_err(|e| UpstreamError::Network(e.to_string()))?;
     let status = resp.status();
     if status.is_success() {
-        Ok(forward_response(resp).await)
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let stream = body
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let response = forward_response(shared, resp, model, stream).await;
+        Ok(response)
     } else {
         let text = resp.text().await.unwrap_or_default();
         let msg = format!("upstream {status}: {}", truncate(&text, 500));
@@ -83,8 +95,21 @@ fn is_quota_error(status: u16, body: &str) -> bool {
             && (lower.contains("quota") || body.contains("配额")))
 }
 
+/// Max bytes buffered from a response body for usage extraction. The final
+/// SSE chunk (with usage) or the JSON `usage` field sits at the very end of
+/// the body, so a generous tail budget is enough; anything beyond is dropped
+/// and the request simply isn't accounted.
+const USAGE_TAP_LIMIT: usize = 256 * 1024;
+
 /// Convert a successful `reqwest` response into a streaming axum response.
-async fn forward_response(upstream: reqwest::Response) -> Response {
+/// The body passes through a tap so the final usage (token counts) can be
+/// recorded once the stream completes, without delaying the client.
+async fn forward_response(
+    shared: &Shared,
+    upstream: reqwest::Response,
+    model: String,
+    stream: bool,
+) -> Response {
     let status = StatusCode::from_u16(upstream.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let content_type = upstream
@@ -96,8 +121,45 @@ async fn forward_response(upstream: reqwest::Response) -> Response {
     if let Some(ct) = content_type {
         builder = builder.header("content-type", ct);
     }
+
+    // Shared tap buffer; capped so huge responses can't balloon memory.
+    // Keeps the TAIL of the body: the usage field (JSON `usage` object, or
+    // the final SSE frame carrying it) sits at the very end, so once the
+    // limit is reached older bytes are dropped from the front.
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let tap_buf = buf.clone();
+    let tapped = upstream.bytes_stream().inspect(move |item| {
+        if let Ok(bytes) = item {
+            let mut b = tap_buf.lock().expect("usage tap lock poisoned");
+            b.extend_from_slice(bytes);
+            if b.len() > USAGE_TAP_LIMIT {
+                let excess = b.len() - USAGE_TAP_LIMIT;
+                b.drain(..excess);
+            }
+        }
+    });
+
+    // When the body has been fully forwarded, run usage extraction on the
+    // buffered copy. The sentinel item yields nothing to the client (the
+    // unfold's `None` terminates the stream) and accounting happens in a
+    // blocking task so the HTTP task is never blocked on SQLite.
+    let done_buf = buf;
+    let done_shared = shared.clone();
+    let done_model = model;
+    let done_stream = stream;
+    let with_tail = tapped.chain(futures_util::stream::once(async move {
+        let body = done_buf.lock().expect("usage tap lock poisoned").clone();
+        let shared = done_shared.clone();
+        let model = done_model.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            usage::record_from_body(&shared, &model, done_stream, &body);
+        });
+        // Match the upstream stream's item type (reqwest::Error).
+        Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::new())
+    }));
+
     builder
-        .body(Body::from_stream(upstream.bytes_stream()))
+        .body(Body::from_stream(with_tail))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
@@ -291,6 +353,11 @@ async fn fallback_404() -> Response {
 }
 
 async fn auth_mw(State(shared): State<Shared>, req: Request, next: Next) -> Response {
+    // CORS preflight (OPTIONS) must pass without auth — browsers never
+    // attach the API key to preflight requests.
+    if req.method() == axum::http::Method::OPTIONS {
+        return next.run(req).await;
+    }
     if req.uri().path() == "/health" {
         return next.run(req).await;
     }
@@ -345,6 +412,23 @@ async fn access_log(req: Request, next: Next) -> Response {
 }
 
 fn build_router(shared: Shared) -> Router {
+    // The config UI (WebView origin) probes models via fetch; allow only the
+    // known WebView / dev origins, never arbitrary websites.
+    // NOTE: cors must be added LAST so it wraps the auth layer — otherwise
+    // 401 responses from auth would bypass CORS headers entirely.
+    let allowed: Vec<axum::http::HeaderValue> = [
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "http://localhost:1420",
+        "http://127.0.0.1:1420",
+    ]
+    .iter()
+    .filter_map(|v| v.parse().ok())
+    .collect();
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::AllowOrigin::list(allowed))
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+        .allow_headers(tower_http::cors::Any);
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
@@ -353,6 +437,7 @@ fn build_router(shared: Shared) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(middleware::from_fn(access_log))
         .layer(middleware::from_fn_with_state(shared.clone(), auth_mw))
+        .layer(cors)
         .with_state(shared)
 }
 

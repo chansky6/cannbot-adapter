@@ -1,9 +1,12 @@
 mod config;
 mod jwt;
+mod logging;
 mod proxy;
+mod secret;
 mod state;
 mod tray;
 mod upstream;
+mod usage;
 
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -40,17 +43,28 @@ pub struct StatusView {
     pub api_base: String,
 }
 
+/// Fully mask an auto-discovered VK for display: the gateway VKs are also
+/// secrets, so never show even a prefix/suffix.
 fn mask_vk(vk: Option<String>) -> Option<String> {
-    vk.map(|v| {
-        let head: String = v.chars().take(8).collect();
-        let tail: String = v.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-        format!("{head}…{tail}")
-    })
+    vk.map(|_| "**********".to_string())
 }
 
 #[tauri::command]
 fn get_config(state: tauri::State<Shared>) -> AppConfig {
-    state.config.read().expect("config lock poisoned").clone()
+    let mut cfg = state.config.read().expect("config lock poisoned").clone();
+    // Never send the plaintext VK to the frontend; a fully masked value means
+    // "a VK is configured" and the backend keeps the real secret.
+    cfg.user_vk = if cfg.user_vk.is_some() {
+        Some(crate::secret::MASK_SENTINEL.to_string())
+    } else {
+        None
+    };
+    // manual_vk may hold real secrets too — replace with the sentinel when a
+    // list is configured; the frontend round-trips it to mean "unchanged".
+    if cfg.manual_vk.is_some() {
+        cfg.manual_vk = Some(crate::secret::MASK_SENTINEL.to_string());
+    }
+    cfg
 }
 
 #[tauri::command]
@@ -58,24 +72,36 @@ async fn save_config(
     state: tauri::State<'_, Shared>,
     new_config: AppConfig,
 ) -> Result<serde_json::Value, String> {
-    if new_config.bind == "0.0.0.0" && new_config.effective_api_key().is_none() {
+    // Merge the incoming config with stored secrets: the frontend round-trips
+    // masked sentinel values, so a sentinel means "unchanged".
+    let mut incoming = new_config;
+    {
+        let old = state.config.read().expect("config lock poisoned");
+        if incoming.user_vk.as_deref() == Some(crate::secret::MASK_SENTINEL) {
+            incoming.user_vk = old.user_vk.clone();
+        }
+        if incoming.manual_vk.as_deref() == Some(crate::secret::MASK_SENTINEL) {
+            incoming.manual_vk = old.manual_vk.clone();
+        }
+    }
+    if incoming.bind == "0.0.0.0" && incoming.effective_api_key().is_none() {
         return Err("监听 0.0.0.0（局域网）时必须设置本地 API Key".to_string());
     }
-    if new_config.port == 0 {
+    if incoming.port == 0 {
         return Err("端口无效".to_string());
     }
-    if new_config.vk_policy == crate::config::VkPolicy::Manual
-        && new_config.effective_manual_vks().is_empty()
+    if incoming.vk_policy == crate::config::VkPolicy::Manual
+        && incoming.effective_manual_vks().is_empty()
     {
         return Err("VK 策略为「手动指定」时必须填写至少一个 VK".to_string());
     }
     let needs_restart = {
         let old = state.config.read().expect("config lock poisoned");
-        old.port != new_config.port || old.bind != new_config.bind
+        old.port != incoming.port || old.bind != incoming.bind
         // api_key is read per-request, no restart needed
     };
-    *state.config.write().expect("config lock poisoned") = new_config.clone();
-    config::save_config(&state.app, &new_config)?;
+    *state.config.write().expect("config lock poisoned") = incoming.clone();
+    config::save_config(&state.app, &incoming)?;
 
     // user VK may have changed — re-authenticate in the background
     let auth_shared = state.inner().clone();
@@ -168,6 +194,8 @@ pub struct ModelInfo {
     pub model: String,
     /// Set when this row is a local alias (`alias_of` = real model).
     pub alias_of: Option<String>,
+    /// Alias configured for this real model, if any (edit-in-place field).
+    pub alias: Option<String>,
     /// Supported by the builtin VK (3000w/day pool).
     pub builtin: bool,
     /// Supported by the personal VK (1e8/day pool).
@@ -183,6 +211,11 @@ fn get_models(state: tauri::State<'_, Shared>) -> Vec<ModelInfo> {
     let mut out: Vec<ModelInfo> = Vec::new();
     if let Some(r) = registry {
         for e in &r.entries {
+            let alias = cfg
+                .model_aliases
+                .iter()
+                .find(|(_, target)| *target == &e.model)
+                .map(|(a, _)| a.clone());
             if let Some(existing) = out.iter_mut().find(|m| m.model == e.model) {
                 if e.builtin {
                     existing.builtin = true;
@@ -193,6 +226,7 @@ fn get_models(state: tauri::State<'_, Shared>) -> Vec<ModelInfo> {
                 out.push(ModelInfo {
                     model: e.model.clone(),
                     alias_of: None,
+                    alias,
                     builtin: e.builtin,
                     personal: !e.builtin,
                     context_length: e.context_length,
@@ -206,6 +240,7 @@ fn get_models(state: tauri::State<'_, Shared>) -> Vec<ModelInfo> {
             out.push(ModelInfo {
                 model: alias.clone(),
                 alias_of: Some(target.clone()),
+                alias: None,
                 builtin: false,
                 personal: false,
                 context_length: None,
@@ -214,6 +249,15 @@ fn get_models(state: tauri::State<'_, Shared>) -> Vec<ModelInfo> {
         }
     }
     out
+}
+
+/// Fetch the model list from the gateway and refresh the registry.
+/// Lightweight variant of `test_connection` — no chat request, no quota use.
+#[tauri::command]
+async fn fetch_models_cmd(state: tauri::State<'_, Shared>) -> Result<serde_json::Value, String> {
+    let shared = state.inner().clone();
+    let reg = upstream::fetch_models(&shared).await?;
+    Ok(json!({ "models_count": reg.entries.len() }))
 }
 
 /// Connectivity probe: JWT -> model list -> one mini chat request (max_tokens=5).
@@ -277,16 +321,6 @@ async fn test_connection(state: tauri::State<'_, Shared>) -> Result<serde_json::
 }
 
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        // stderr is unbuffered; stdout would silently swallow logs when
-        // redirected to a file and the process is killed.
-        .with_writer(std::io::stderr)
-        .init();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::show_main_window(app);
@@ -299,6 +333,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            logging::init(app.handle());
             let handle = app.handle().clone();
             let shared: Shared = Arc::new(SharedState {
                 http: reqwest::Client::builder()
@@ -358,7 +393,10 @@ pub fn run() {
             get_models,
             get_autostart,
             set_autostart,
-            test_connection
+            test_connection,
+            fetch_models_cmd,
+            usage::get_usage,
+            usage::clear_usage
         ])
         .run(tauri::generate_context!())
         .expect("error while running cannbot-adapter");

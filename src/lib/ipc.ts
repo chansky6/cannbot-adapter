@@ -6,6 +6,7 @@ export interface AppConfig {
   port: number;
   bind: string;
   api_key: string | null;
+  /** Fully masked sentinel from the backend (never the plaintext VK). */
   user_vk: string | null;
   device_id: string | null;
   vk_policy: VkPolicy;
@@ -42,10 +43,20 @@ export interface TestResult {
 export interface ModelInfo {
   model: string;
   alias_of: string | null;
+  /** Alias configured for this model (frontend-editable). */
+  alias: string | null;
   builtin: boolean;
   personal: boolean;
   context_length: number | null;
   max_tokens: number | null;
+}
+
+export interface UsageRow {
+  date: string;
+  model: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
 }
 
 export function getModels(): Promise<ModelInfo[]> {
@@ -78,4 +89,17 @@ export function setAutostart(enabled: boolean): Promise<void> {
 
 export function testConnection(): Promise<TestResult> {
   return invoke("test_connection");
+}
+
+/** Lightweight refresh of the gateway model list (no chat request). */
+export function fetchModelsCmd(): Promise<{ models_count: number }> {
+  return invoke("fetch_models_cmd");
+}
+
+export function getUsage(days?: number): Promise<UsageRow[]> {
+  return invoke("get_usage", { days });
+}
+
+export function clearUsage(): Promise<void> {
+  return invoke("clear_usage");
 }
