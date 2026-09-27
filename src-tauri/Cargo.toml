@@ -1,0 +1,37 @@
+[package]
+name = "cannbot-adapter"
+version = "0.1.0"
+description = "Local OpenAI-compatible adapter for the CANNBot gateway"
+edition = "2021"
+
+[lib]
+name = "cannbot_adapter_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+notify = "8"
+dirs = "6"
+rand = "0.9"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
