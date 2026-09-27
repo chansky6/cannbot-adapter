@@ -17,8 +17,6 @@ jobs:
         include:
           - platform: macos-latest
             args: --target aarch64-apple-darwin
-          - platform: macos-latest
-            args: --target x86_64-apple-darwin
           - platform: windows-latest
             args: ""
 
@@ -33,7 +31,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -52,7 +50,7 @@ jobs:
           releaseBody: |
             本地 OpenAI 兼容适配器，将 CANNBot 网关暴露为标准 /v1 接口。
 
-            - macOS: aarch64 (Apple Silicon) / x86_64 dmg
+            - macOS: aarch64 (Apple Silicon) dmg
             - Windows: msi + nsis 安装包
           releaseDraft: true
           prerelease: false

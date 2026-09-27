@@ -68,7 +68,7 @@ npm run tauri build    # 生产构建（产物在 src-tauri/target/release/bundl
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-产物：macOS dmg（aarch64 + x86_64）、Windows msi + nsis。
+产物：macOS dmg（aarch64）、Windows msi + nsis。
 
 ## 架构
 
