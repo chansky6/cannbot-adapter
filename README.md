@@ -95,6 +95,8 @@ git tag v0.1.0 && git push origin v0.1.0
 
 模块：`src-tauri/src/` 下 `config.rs`（配置持久化）、`jwt.rs`（VK→JWT 认证）、`upstream.rs`（网关客户端/模型注册表）、`proxy.rs`（本地 OpenAI 端点与 fallback 主循环）、`tray.rs`（托盘）、`lib.rs`（组装与 IPC 命令）。
 
+前端（`src/`）：`App.svelte` 仅做编排（加载/页签/事件监听/保存）；`components/` 按卡片拆分（StatusCard / AccessInfoCard / ServerSettingsCard / ModelListCard / AliasCard / UsageCard / Toast）；`lib/` 为纯逻辑（`ipc.ts` IPC 封装、`config-form.svelte.ts` 配置表单状态与 VK 掩码哨兵、`usage.ts` 用量聚合、`toast.svelte.ts` 全局提示、`format.ts` / `clipboard.ts` 工具）；`styles/shared.css` 承载跨组件通用样式。
+
 认证链路（用户唯一凭据是个人 VK）：
 
 ```
