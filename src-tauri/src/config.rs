@@ -204,8 +204,10 @@ pub fn load_or_init(app: &tauri::AppHandle) -> AppConfig {
             }
         }
     }
-    let mut cfg = AppConfig::default();
-    cfg.api_key = Some(generate_api_key());
+    let cfg = AppConfig {
+        api_key: Some(generate_api_key()),
+        ..AppConfig::default()
+    };
     if let Err(e) = save_config(app, &cfg) {
         tracing::warn!(error = %e, "failed to persist initial config");
     }
@@ -227,7 +229,11 @@ pub fn save_config(app: &tauri::AppHandle, cfg: &AppConfig) -> Result<(), String
     }
     let text =
         serde_json::to_string_pretty(&persisted).map_err(|e| format!("serialize config: {e}"))?;
-    std::fs::write(&path, text).map_err(|e| format!("write config failed: {e}"))?;
+    // Atomic write: a crash mid-write must never leave a truncated config.json
+    // (it holds the encrypted VK; losing it forces the user to re-enter it).
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("write config failed: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("replace config failed: {e}"))?;
     tracing::info!(?path, "config saved");
     Ok(())
 }

@@ -71,6 +71,19 @@
       showToast("err", "VK 策略为「手动指定」时必须填写至少一个 VK");
       return;
     }
+    const realModels = new Set(models.map((m) => m.model).filter((m) => !models.find((x) => x.model === m && x.alias_of === m)));
+    for (const [alias, target] of Object.entries(cfg.model_aliases)) {
+      if (alias === target) {
+        showToast("err", `别名「${alias}」不能指向自身`);
+        return;
+      }
+      // A row whose model is itself an alias_of means alias-of-alias; real
+      // gateway models are the ones listed without alias_of.
+      if (realModels.has(alias)) {
+        showToast("err", `别名「${alias}」与真实模型名冲突，会导致该模型无法直接调用，请换一个别名`);
+        return;
+      }
+    }
     saving = true;
     try {
       const r = await saveConfig(cfg);

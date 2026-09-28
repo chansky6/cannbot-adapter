@@ -122,10 +122,13 @@ pub async fn current_jwt(shared: &Shared) -> Option<String> {
 }
 
 /// Fetch the model list from the gateway and build the registry.
+/// Returns `Err` with a marker prefix on HTTP 401 so callers can react to an
+/// expired/revoked JWT (invalidate + re-authenticate).
 pub async fn fetch_models(shared: &Shared) -> Result<ModelsRegistry, String> {
+    const AUTH_FAILED: &str = "auth-failed:";
     let jwt = current_jwt(shared)
         .await
-        .ok_or("JWT 未就绪（VK 未配置或认证失败）")?;
+        .ok_or(format!("{AUTH_FAILED} JWT 未就绪（VK 未配置或认证失败）"))?;
     let url = format!("{GATEWAY_BASE}/cannbot/api/models/personal");
     let resp = shared
         .http
@@ -135,12 +138,15 @@ pub async fn fetch_models(shared: &Shared) -> Result<ModelsRegistry, String> {
         .await
         .map_err(|e| format!("请求模型列表失败: {e}"))?;
     let status = resp.status();
+    if status.as_u16() == 401 {
+        return Err(format!("{AUTH_FAILED} 模型列表接口返回 401：JWT 已失效"));
+    }
     let text = resp
         .text()
         .await
         .map_err(|e| format!("读取模型列表响应失败: {e}"))?;
     if !status.is_success() {
-        return Err(format!("模型列表接口返回 {status}: {}", truncate(&text, 300)));
+        return Err(format!("模型列表接口返回 {status}: {}", crate::util::truncate(&text, 300)));
     }
     let parsed: ModelsApiResp =
         serde_json::from_str(&text).map_err(|e| format!("解析模型列表失败: {e}"))?;
@@ -186,29 +192,37 @@ pub async fn fetch_models(shared: &Shared) -> Result<ModelsRegistry, String> {
 /// Background loop: keep the models registry fresh.
 /// Ensures a JWT exists (VK authentication) before each fetch attempt;
 /// retry every 30s until the first success, then refresh every 10 minutes.
+/// A 401 from the models endpoint invalidates the cached JWT so the next
+/// iteration re-authenticates (the short retry delay keeps recovery fast).
 pub fn spawn_sync_loop(shared: Shared) {
+    const AUTH_FAILED: &str = "auth-failed:";
     tauri::async_runtime::spawn(async move {
         loop {
             if current_jwt(&shared).await.is_none() {
                 let _ = crate::jwt::authenticate(&shared).await;
             }
+            let mut fetch_failed = false;
             if let Err(e) = fetch_models(&shared).await {
-                tracing::warn!(error = %e, "models fetch failed, will retry");
+                fetch_failed = true;
+                if let Some(reason) = e.strip_prefix(AUTH_FAILED) {
+                    tracing::warn!(reason, "models fetch rejected our JWT; invalidating and re-authenticating");
+                    crate::jwt::invalidate(&shared);
+                } else {
+                    tracing::warn!(error = %e, "models fetch failed, will retry");
+                }
             }
             let delay = if shared.models.read().expect("models lock poisoned").is_some() {
                 Duration::from_secs(600)
             } else {
                 Duration::from_secs(30)
             };
+            // Re-auth after an invalidation should not wait a full cycle.
+            let delay = if fetch_failed && current_jwt(&shared).await.is_none() {
+                Duration::from_secs(3)
+            } else {
+                delay
+            };
             tokio::time::sleep(delay).await;
         }
     });
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
 }

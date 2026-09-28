@@ -65,7 +65,7 @@
     {/if}
   </div>
   {#if models.length === 0}
-    <p class="hint">尚未从网关同步（启动后自动拉取，也可点击顶部「测试连接」触发）。</p>
+    <p class="hint">尚未从网关同步（启动后自动拉取，也可点击顶部「获取模型」触发）。</p>
   {:else}
     <div class="model-list">
       {#each models as m (m.model)}

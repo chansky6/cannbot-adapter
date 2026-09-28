@@ -7,6 +7,7 @@ mod state;
 mod tray;
 mod upstream;
 mod usage;
+mod util;
 
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -18,7 +19,6 @@ use tauri_plugin_autostart::MacosLauncher;
 
 use crate::config::AppConfig;
 use crate::jwt::JwtStatusView;
-use crate::proxy::UpstreamError;
 use crate::state::{JwtState, Shared, SharedState};
 
 #[derive(Serialize, Clone)]
@@ -94,6 +94,27 @@ async fn save_config(
         && incoming.effective_manual_vks().is_empty()
     {
         return Err("VK 策略为「手动指定」时必须填写至少一个 VK".to_string());
+    }
+    // An alias equal to a real gateway model name would silently hijack
+    // requests for that model (aliases are resolved before the registry
+    // lookup), so reject the collision instead.
+    {
+        let models = state.models.read().expect("models lock poisoned");
+        if let Some(reg) = models.as_ref() {
+            let real_ids = reg.model_ids();
+            let real: std::collections::HashSet<&str> =
+                real_ids.iter().map(String::as_str).collect();
+            for (alias, target) in &incoming.model_aliases {
+                if alias == target {
+                    return Err(format!("别名「{alias}」不能指向自身"));
+                }
+                if real.contains(alias.as_str()) {
+                    return Err(format!(
+                        "别名「{alias}」与真实模型名冲突，会导致该模型无法直接调用，请换一个别名"
+                    ));
+                }
+            }
+        }
     }
     let needs_restart = {
         let old = state.config.read().expect("config lock poisoned");
@@ -252,72 +273,12 @@ fn get_models(state: tauri::State<'_, Shared>) -> Vec<ModelInfo> {
 }
 
 /// Fetch the model list from the gateway and refresh the registry.
-/// Lightweight variant of `test_connection` — no chat request, no quota use.
+/// No chat request, no quota use.
 #[tauri::command]
 async fn fetch_models_cmd(state: tauri::State<'_, Shared>) -> Result<serde_json::Value, String> {
     let shared = state.inner().clone();
     let reg = upstream::fetch_models(&shared).await?;
     Ok(json!({ "models_count": reg.entries.len() }))
-}
-
-/// Connectivity probe: JWT -> model list -> one mini chat request (max_tokens=5).
-#[tauri::command]
-async fn test_connection(state: tauri::State<'_, Shared>) -> Result<serde_json::Value, String> {
-    let shared = state.inner().clone();
-    let jwt_ok = upstream::current_jwt(&shared).await.is_some();
-
-    let reg = upstream::fetch_models(&shared).await?;
-    let model = reg
-        .entries
-        .iter()
-        .find(|e| e.model.contains("flash"))
-        .map(|e| e.model.clone())
-        .or_else(|| reg.entries.first().map(|e| e.model.clone()))
-        .ok_or_else(|| "模型列表为空".to_string())?;
-    let vks = {
-        let v = reg.vks_for(&model);
-        if v.is_empty() {
-            reg.all_vks()
-        } else {
-            v
-        }
-    };
-
-    let body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 5
-    });
-    let mut chat_ok = false;
-    let mut chat_msg = String::new();
-    for vk in &vks {
-        let Some(jwt) = upstream::current_jwt(&shared).await else {
-            break;
-        };
-        match proxy::send_chat(&shared, &jwt, vk, &body).await {
-            Ok(resp) => {
-                chat_ok = true;
-                chat_msg = format!("模型 {model} 响应 {}", resp.status());
-                break;
-            }
-            Err(UpstreamError::Quota(m)) => {
-                chat_msg = m;
-                continue;
-            }
-            Err(e) => {
-                chat_msg = e.message();
-                break;
-            }
-        }
-    }
-
-    Ok(json!({
-        "jwt_ok": jwt_ok,
-        "models_count": reg.entries.len(),
-        "chat_ok": chat_ok,
-        "chat_model": model,
-        "chat_message": chat_msg,
-    }))
 }
 
 pub fn run() {
@@ -393,7 +354,6 @@ pub fn run() {
             get_models,
             get_autostart,
             set_autostart,
-            test_connection,
             fetch_models_cmd,
             usage::get_usage,
             usage::clear_usage

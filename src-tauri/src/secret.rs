@@ -88,7 +88,7 @@ pub fn encrypt(app: &tauri::AppHandle, plain: &str) -> Result<String, String> {
     let mut nonce_bytes = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce_bytes);
     let ct = cipher
-        .encrypt(&Nonce::from_slice(&nonce_bytes), plain.as_bytes())
+        .encrypt(Nonce::from_slice(&nonce_bytes), plain.as_bytes())
         .map_err(|e| format!("encrypt: {e}"))?;
     // nonce || ciphertext
     let mut blob = nonce_bytes.to_vec();

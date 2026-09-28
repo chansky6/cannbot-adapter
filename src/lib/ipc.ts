@@ -32,14 +32,6 @@ export interface StatusView {
   api_base: string;
 }
 
-export interface TestResult {
-  jwt_ok: boolean;
-  models_count: number;
-  chat_ok: boolean;
-  chat_model: string;
-  chat_message: string;
-}
-
 export interface ModelInfo {
   model: string;
   alias_of: string | null;
@@ -85,10 +77,6 @@ export function getAutostart(): Promise<boolean> {
 
 export function setAutostart(enabled: boolean): Promise<void> {
   return invoke("set_autostart", { enabled });
-}
-
-export function testConnection(): Promise<TestResult> {
-  return invoke("test_connection");
 }
 
 /** Lightweight refresh of the gateway model list (no chat request). */

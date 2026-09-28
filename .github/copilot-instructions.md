@@ -11,7 +11,7 @@ npm run check                # svelte-check 前端类型检查（改动前端后
 npm run build                # 仅构建前端（vite）
 npm run tauri build          # 生产构建安装包（产物在 src-tauri/target/release/bundle/）
 
-cd src-tauri && cargo test   # Rust 测试（目前集中在 usage.rs / secret.rs）
+cd src-tauri && cargo test   # Rust 测试（目前集中在 util.rs / usage.rs / secret.rs）
 cd src-tauri && cargo test extracts_json_usage   # 运行单个测试
 cd src-tauri && cargo check  # Rust 快速校验
 ```

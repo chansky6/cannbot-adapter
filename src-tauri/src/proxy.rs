@@ -15,7 +15,7 @@ use tauri::Emitter;
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{ServerHandle, Shared};
-use crate::{jwt, upstream, usage};
+use crate::{jwt, upstream, usage, util};
 
 /// Classifications of upstream failures that drive the VK fallback loop.
 pub enum UpstreamError {
@@ -26,17 +26,6 @@ pub enum UpstreamError {
     /// Any other upstream error, forwarded to the client as-is.
     Other(u16, String),
     Network(String),
-}
-
-impl UpstreamError {
-    pub fn message(&self) -> String {
-        match self {
-            UpstreamError::Unauthorized(m)
-            | UpstreamError::Quota(m)
-            | UpstreamError::Other(_, m)
-            | UpstreamError::Network(m) => m.clone(),
-        }
-    }
 }
 
 /// POST one chat request to the gateway with the given JWT + VK.
@@ -171,11 +160,7 @@ fn openai_error(status: StatusCode, msg: impl Into<String>) -> Response {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
+    util::truncate(s, max)
 }
 
 async fn chat_completions(State(shared): State<Shared>, axum::extract::Json(body): axum::extract::Json<Value>) -> Response {

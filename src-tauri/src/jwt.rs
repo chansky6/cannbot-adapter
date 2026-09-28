@@ -14,6 +14,18 @@ pub struct JwtState {
     pub message: String,
 }
 
+/// Drop the cached token (e.g. after an upstream 401 on a non-chat endpoint)
+/// so the next `authenticate()` actually re-authenticates instead of
+/// short-circuiting on the stale token.
+pub fn invalidate(shared: &Shared) {
+    let mut jwt = shared.jwt.write().expect("jwt lock poisoned");
+    if jwt.token.is_some() {
+        jwt.token = None;
+        jwt.message = "JWT 已失效，等待重新认证".to_string();
+        tracing::info!("cached JWT invalidated");
+    }
+}
+
 /// Frontend-safe view of the authentication state.
 #[derive(Debug, Clone, Serialize)]
 pub struct JwtStatusView {
@@ -97,7 +109,7 @@ pub async fn authenticate(shared: &Shared) -> JwtState {
                     let body = r.text().await.unwrap_or_default();
                     JwtState {
                         token: None,
-                        message: format!("VK 认证失败（{code}）: {}", truncate(&body, 200)),
+                        message: format!("VK 认证失败（{code}）: {}", crate::util::truncate(&body, 200)),
                     }
                 }
                 Err(e) => JwtState {
@@ -115,12 +127,4 @@ pub async fn authenticate(shared: &Shared) -> JwtState {
     let _ = shared.app.emit("jwt-status", &view);
     tray::set_status_tooltip(&shared.app, &view);
     shared.jwt.read().expect("jwt lock poisoned").clone()
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
 }
