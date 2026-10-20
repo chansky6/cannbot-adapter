@@ -2,18 +2,14 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
-use crate::jwt::JwtStatusView;
+use cannbot_core::jwt::JwtStatusView;
 
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开配置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出 cannbot-adapter", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
     TrayIconBuilder::with_id("main")
-        .icon(
-            app.default_window_icon()
-                .expect("app icon missing")
-                .clone(),
-        )
+        .icon(app.default_window_icon().expect("app icon missing").clone())
         .tooltip("CANNBot Adapter · 启动中")
         .menu(&menu)
         .show_menu_on_left_click(false)

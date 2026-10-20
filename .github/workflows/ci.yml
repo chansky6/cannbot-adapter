@@ -28,7 +28,30 @@ jobs:
       - name: Frontend build
         run: npm run build
 
-  rust:
+  # core + cli have no GUI dependencies — lint and test them without
+  # installing any Tauri system libraries (this is also the proof that the
+  # CLI builds on headless Linux).
+  core-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy -p cannbot-core -p cannbot-cli -- -D warnings
+
+      - name: Tests
+        run: cargo test -p cannbot-core -p cannbot-cli
+
+  desktop:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,13 +66,9 @@ jobs:
           components: clippy
 
       - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
 
       - name: Clippy (deny warnings)
-        run: cargo clippy -- -D warnings
-        working-directory: src-tauri
+        run: cargo clippy -p cannbot-adapter -- -D warnings
 
       - name: Tests
-        run: cargo test
-        working-directory: src-tauri
+        run: cargo test -p cannbot-adapter

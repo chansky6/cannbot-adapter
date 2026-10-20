@@ -4,6 +4,10 @@
 //! this module extracts the `usage` field (non-stream JSON, or the final SSE
 //! `data:` frame carrying usage) and aggregates it into a small SQLite
 //! database: one row per (day, model) with token counts and request count.
+//!
+//! Recording happens regardless of which frontend drives the core; only the
+//! *query* side is frontend-specific (the desktop app shows charts, the CLI
+//! offers no query command by design).
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -28,13 +32,7 @@ struct TokenCounts {
 }
 
 fn db_path(shared: &Shared) -> PathBuf {
-    use tauri::Manager;
-    let dir = shared
-        .app
-        .path()
-        .app_config_dir()
-        .expect("app config dir unavailable");
-    dir.join("usage.db")
+    shared.config_dir.join("usage.db")
 }
 
 fn with_conn<T>(shared: &Shared, f: impl FnOnce(&Connection) -> T) -> Result<T, String> {
@@ -118,7 +116,7 @@ pub fn record_from_body(shared: &Shared, model: &str, stream: bool, body: &[u8])
 fn record(shared: &Shared, model: &str, counts: TokenCounts) -> Result<(), String> {
     with_conn(shared, |conn| {
         // Let SQLite compute the local date so recording and querying
-        // (`date('now', 'localtime')` in get_usage) can never disagree.
+        // (`date('now', 'localtime')` in get_usage_rows) can never disagree.
         let date: String = conn
             .query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
@@ -137,13 +135,9 @@ fn record(shared: &Shared, model: &str, counts: TokenCounts) -> Result<(), Strin
 }
 
 /// Aggregate usage rows for the frontend.
-#[tauri::command]
-pub fn get_usage(
-    shared: tauri::State<Shared>,
-    days: Option<u32>,
-) -> Result<Vec<UsageRow>, String> {
+pub fn get_usage_rows(shared: &Shared, days: Option<u32>) -> Result<Vec<UsageRow>, String> {
     let limit = days.unwrap_or(30) as i64;
-    with_conn(&shared, |conn| {
+    with_conn(shared, |conn| {
         let mut stmt = conn
             .prepare(
                 "SELECT date, model, requests, input_tokens, output_tokens
@@ -172,9 +166,8 @@ pub fn get_usage(
 }
 
 /// Remove all usage records.
-#[tauri::command]
-pub fn clear_usage(shared: tauri::State<Shared>) -> Result<(), String> {
-    with_conn(&shared, |conn| {
+pub fn clear_usage_rows(shared: &Shared) -> Result<(), String> {
+    with_conn(shared, |conn| {
         conn.execute("DELETE FROM usage", [])
             .map_err(|e| e.to_string())?;
         Ok(())

@@ -1,25 +1,24 @@
-mod config;
-mod jwt;
+//! Tauri desktop app — a thin shell over `cannbot-core`.
+//!
+//! This crate owns everything GUI-specific (windows, tray, autostart, file
+//! logging, Tauri commands and event forwarding); all business logic lives
+//! in the core crate shared with the `cannbotcli` CLI.
+
 mod logging;
-mod proxy;
-mod secret;
-mod state;
 mod tray;
-mod upstream;
-mod usage;
-mod util;
 
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
-use serde_json::json;
 use tauri::{Emitter, Manager};
 use tauri_plugin_autostart::MacosLauncher;
 
-use crate::config::AppConfig;
-use crate::jwt::JwtStatusView;
-use crate::state::{JwtState, Shared, SharedState};
+use cannbot_core::config::{self, AppConfig};
+use cannbot_core::jwt::{self, JwtStatusView};
+use cannbot_core::proxy;
+use cannbot_core::state::{EventSink, Shared, SharedState};
+use cannbot_core::upstream;
+use cannbot_core::usage;
 
 #[derive(Serialize, Clone)]
 pub struct VkStatusView {
@@ -36,7 +35,7 @@ pub struct StatusView {
     pub server_error: Option<String>,
     pub jwt: JwtStatusView,
     pub vk: VkStatusView,
-    pub vk_policy: crate::config::VkPolicy,
+    pub vk_policy: config::VkPolicy,
     pub models_count: Option<usize>,
     pub models_synced_at: Option<u64>,
     pub alias_count: usize,
@@ -55,14 +54,14 @@ fn get_config(state: tauri::State<Shared>) -> AppConfig {
     // Never send the plaintext VK to the frontend; a fully masked value means
     // "a VK is configured" and the backend keeps the real secret.
     cfg.user_vk = if cfg.user_vk.is_some() {
-        Some(crate::secret::MASK_SENTINEL.to_string())
+        Some(cannbot_core::secret::MASK_SENTINEL.to_string())
     } else {
         None
     };
     // manual_vk may hold real secrets too — replace with the sentinel when a
     // list is configured; the frontend round-trips it to mean "unchanged".
     if cfg.manual_vk.is_some() {
-        cfg.manual_vk = Some(crate::secret::MASK_SENTINEL.to_string());
+        cfg.manual_vk = Some(cannbot_core::secret::MASK_SENTINEL.to_string());
     }
     cfg
 }
@@ -77,44 +76,17 @@ async fn save_config(
     let mut incoming = new_config;
     {
         let old = state.config.read().expect("config lock poisoned");
-        if incoming.user_vk.as_deref() == Some(crate::secret::MASK_SENTINEL) {
+        if incoming.user_vk.as_deref() == Some(cannbot_core::secret::MASK_SENTINEL) {
             incoming.user_vk = old.user_vk.clone();
         }
-        if incoming.manual_vk.as_deref() == Some(crate::secret::MASK_SENTINEL) {
+        if incoming.manual_vk.as_deref() == Some(cannbot_core::secret::MASK_SENTINEL) {
             incoming.manual_vk = old.manual_vk.clone();
         }
     }
-    if incoming.bind == "0.0.0.0" && incoming.effective_api_key().is_none() {
-        return Err("监听 0.0.0.0（局域网）时必须设置本地 API Key".to_string());
-    }
-    if incoming.port == 0 {
-        return Err("端口无效".to_string());
-    }
-    if incoming.vk_policy == crate::config::VkPolicy::Manual
-        && incoming.effective_manual_vks().is_empty()
     {
-        return Err("VK 策略为「手动指定」时必须填写至少一个 VK".to_string());
-    }
-    // An alias equal to a real gateway model name would silently hijack
-    // requests for that model (aliases are resolved before the registry
-    // lookup), so reject the collision instead.
-    {
+        // Alias collision checks need the freshest models registry.
         let models = state.models.read().expect("models lock poisoned");
-        if let Some(reg) = models.as_ref() {
-            let real_ids = reg.model_ids();
-            let real: std::collections::HashSet<&str> =
-                real_ids.iter().map(String::as_str).collect();
-            for (alias, target) in &incoming.model_aliases {
-                if alias == target {
-                    return Err(format!("别名「{alias}」不能指向自身"));
-                }
-                if real.contains(alias.as_str()) {
-                    return Err(format!(
-                        "别名「{alias}」与真实模型名冲突，会导致该模型无法直接调用，请换一个别名"
-                    ));
-                }
-            }
-        }
+        config::validate(&incoming, models.as_ref())?;
     }
     let needs_restart = {
         let old = state.config.read().expect("config lock poisoned");
@@ -122,7 +94,7 @@ async fn save_config(
         // api_key is read per-request, no restart needed
     };
     *state.config.write().expect("config lock poisoned") = incoming.clone();
-    config::save_config(&state.app, &incoming)?;
+    config::save_config(&state.config_dir, &incoming)?;
 
     // user VK may have changed — re-authenticate in the background
     let auth_shared = state.inner().clone();
@@ -137,7 +109,7 @@ async fn save_config(
     } else {
         false
     };
-    Ok(json!({ "restarted": restarted }))
+    Ok(serde_json::json!({ "restarted": restarted }))
 }
 
 #[tauri::command]
@@ -146,7 +118,7 @@ async fn regenerate_api_key(state: tauri::State<'_, Shared>) -> Result<String, S
     let mut cfg = state.config.read().expect("config lock poisoned").clone();
     cfg.api_key = Some(key.clone());
     *state.config.write().expect("config lock poisoned") = cfg.clone();
-    config::save_config(&state.app, &cfg)?;
+    config::save_config(&state.config_dir, &cfg)?;
     Ok(key)
 }
 
@@ -163,12 +135,6 @@ fn get_status(state: tauri::State<Shared>) -> StatusView {
         .expect("server error lock poisoned")
         .clone();
     let cfg = state.config.read().expect("config lock poisoned");
-    let api_base = format!(
-        "http://{}/v1",
-        server_addr
-            .as_deref()
-            .unwrap_or(&format!("127.0.0.1:{}", cfg.port))
-    );
     StatusView {
         server_running,
         server_addr,
@@ -182,12 +148,12 @@ fn get_status(state: tauri::State<Shared>) -> StatusView {
         models_count: models.as_ref().map(|m| m.entries.len()),
         models_synced_at: models.as_ref().map(|m| {
             m.fetched_at
-                .duration_since(UNIX_EPOCH)
+                .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0)
         }),
         alias_count: cfg.model_aliases.len(),
-        api_base,
+        api_base: state.api_base(),
     }
 }
 
@@ -226,7 +192,7 @@ pub struct ModelInfo {
 }
 
 #[tauri::command]
-fn get_models(state: tauri::State<'_, Shared>) -> Vec<ModelInfo> {
+fn get_models(state: tauri::State<Shared>) -> Vec<ModelInfo> {
     let registry = state.models.read().expect("models lock poisoned").clone();
     let cfg = state.config.read().expect("config lock poisoned").clone();
     let mut out: Vec<ModelInfo> = Vec::new();
@@ -278,7 +244,20 @@ fn get_models(state: tauri::State<'_, Shared>) -> Vec<ModelInfo> {
 async fn fetch_models_cmd(state: tauri::State<'_, Shared>) -> Result<serde_json::Value, String> {
     let shared = state.inner().clone();
     let reg = upstream::fetch_models(&shared).await?;
-    Ok(json!({ "models_count": reg.entries.len() }))
+    Ok(serde_json::json!({ "models_count": reg.entries.len() }))
+}
+
+#[tauri::command]
+fn get_usage(
+    state: tauri::State<Shared>,
+    days: Option<u32>,
+) -> Result<Vec<usage::UsageRow>, String> {
+    usage::get_usage_rows(&state, days)
+}
+
+#[tauri::command]
+fn clear_usage(state: tauri::State<Shared>) -> Result<(), String> {
+    usage::clear_usage_rows(&state)
 }
 
 pub fn run() {
@@ -296,19 +275,27 @@ pub fn run() {
 
             logging::init(app.handle());
             let handle = app.handle().clone();
-            let shared: Shared = Arc::new(SharedState {
-                http: reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(15))
-                    .build()
-                    .expect("failed to build http client"),
-                app: handle.clone(),
-                config: std::sync::RwLock::new(config::load_or_init(&handle)),
-                jwt: std::sync::RwLock::new(JwtState::default()),
-                models: std::sync::RwLock::new(None),
-                server: std::sync::RwLock::new(None),
-                server_error: std::sync::RwLock::new(None),
-                auth_lock: tokio::sync::Mutex::new(()),
+
+            // Core wiring: same config dir the CLI uses, tauri's async
+            // runtime for background tasks, and an event sink that forwards
+            // core events to the WebView and keeps the tray tooltip fresh.
+            let config_dir = app
+                .path()
+                .app_config_dir()
+                .expect("app config dir unavailable");
+            let runtime = tauri::async_runtime::handle().inner().clone();
+            let ev_handle = handle.clone();
+            let events: EventSink = Arc::new(move |event, payload| {
+                let _ = ev_handle.emit(event, payload.clone());
+                if event == "jwt-status" {
+                    if let Ok(view) = serde_json::from_value::<JwtStatusView>(payload) {
+                        tray::set_status_tooltip(&ev_handle, &view);
+                    }
+                }
             });
+            let shared: Shared = Arc::new(
+                SharedState::new(config_dir, runtime, events).expect("failed to init shared state"),
+            );
             app.manage(shared.clone());
 
             let s = shared.clone();
@@ -318,12 +305,13 @@ pub fn run() {
             upstream::spawn_sync_loop(shared.clone());
 
             let s = shared.clone();
+            let err_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = proxy::start_server(s.clone()).await {
                     tracing::error!(error = %e, "http server failed to start");
-                    let _ = s.app.emit(
+                    let _ = err_handle.emit(
                         "server-status",
-                        json!({"running": false, "addr": null, "error": e}),
+                        serde_json::json!({"running": false, "addr": null, "error": e}),
                     );
                 }
             });
@@ -355,8 +343,8 @@ pub fn run() {
             get_autostart,
             set_autostart,
             fetch_models_cmd,
-            usage::get_usage,
-            usage::clear_usage
+            get_usage,
+            clear_usage
         ])
         .run(tauri::generate_context!())
         .expect("error while running cannbot-adapter");

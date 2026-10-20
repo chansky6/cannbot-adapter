@@ -1,0 +1,5 @@
+# Keep build artifacts in src-tauri/target (the pre-workspace location) so
+# existing dependency caches stay hot; also matches where the Tauri CLI
+# expects bundle output.
+[build]
+target-dir = "src-tauri/target"

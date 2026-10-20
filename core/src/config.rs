@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::secret;
+use crate::upstream::ModelsRegistry;
 
 /// How the adapter picks the upstream virtual key (VK) for a request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -113,15 +114,47 @@ impl AppConfig {
     }
 }
 
-pub fn config_dir(app: &tauri::AppHandle) -> PathBuf {
-    use tauri::Manager;
-    app.path()
-        .app_config_dir()
-        .expect("app config dir unavailable")
+/// Cross-field validation rules shared by every frontend. `known_models`
+/// is the freshest models registry, if one has been synced yet.
+///
+/// An alias equal to a real gateway model name would silently hijack
+/// requests for that model (aliases are resolved before the registry
+/// lookup), so reject the collision instead.
+pub fn validate(cfg: &AppConfig, known_models: Option<&ModelsRegistry>) -> Result<(), String> {
+    if cfg.bind == "0.0.0.0" && cfg.effective_api_key().is_none() {
+        return Err("监听 0.0.0.0（局域网）时必须设置本地 API Key".to_string());
+    }
+    if cfg.port == 0 {
+        return Err("端口无效".to_string());
+    }
+    if cfg.vk_policy == VkPolicy::Manual && cfg.effective_manual_vks().is_empty() {
+        return Err("VK 策略为「手动指定」时必须填写至少一个 VK".to_string());
+    }
+    if let Some(reg) = known_models {
+        let ids = reg.model_ids();
+        let real: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        for (alias, target) in &cfg.model_aliases {
+            if alias == target {
+                return Err(format!("别名「{alias}」不能指向自身"));
+            }
+            if real.contains(alias.as_str()) {
+                return Err(format!(
+                    "别名「{alias}」与真实模型名冲突，会导致该模型无法直接调用，请换一个别名"
+                ));
+            }
+        }
+    } else {
+        for (alias, target) in &cfg.model_aliases {
+            if alias == target {
+                return Err(format!("别名「{alias}」不能指向自身"));
+            }
+        }
+    }
+    Ok(())
 }
 
-pub fn config_file(app: &tauri::AppHandle) -> PathBuf {
-    config_dir(app).join("config.json")
+pub fn config_file(dir: &Path) -> PathBuf {
+    dir.join("config.json")
 }
 
 pub fn generate_api_key() -> String {
@@ -139,11 +172,14 @@ fn generate_device_id() -> String {
     use rand::RngCore;
     let mut b = [0u8; 6];
     rand::rng().fill_bytes(&mut b);
-    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("-")
+    b.iter()
+        .map(|x| format!("{x:02x}"))
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
-pub fn load_or_init(app: &tauri::AppHandle) -> AppConfig {
-    let path = config_file(app);
+pub fn load_or_init(dir: &Path) -> AppConfig {
+    let path = config_file(dir);
     if path.exists() {
         if let Ok(text) = std::fs::read_to_string(&path) {
             match serde_json::from_str::<AppConfig>(&text) {
@@ -156,7 +192,7 @@ pub fn load_or_init(app: &tauri::AppHandle) -> AppConfig {
                     let mut needs_reencrypt = false;
                     let mut decrypt_failed = false;
                     if let Some(vk) = cfg.user_vk.take() {
-                        match secret::decrypt(app, &vk) {
+                        match secret::decrypt(dir, &vk) {
                             Ok(plain) => {
                                 // Re-save whenever the stored form wasn't the
                                 // current nonce-prefixed format (plaintext or
@@ -173,7 +209,7 @@ pub fn load_or_init(app: &tauri::AppHandle) -> AppConfig {
                         }
                     }
                     if let Some(mv) = cfg.manual_vk.take() {
-                        match secret::decrypt(app, &mv) {
+                        match secret::decrypt(dir, &mv) {
                             Ok(plain) => {
                                 needs_reencrypt |= true;
                                 cfg.manual_vk = Some(plain);
@@ -187,12 +223,14 @@ pub fn load_or_init(app: &tauri::AppHandle) -> AppConfig {
                     }
                     tracing::info!(?path, "config loaded");
                     if decrypt_failed {
-                        tracing::error!("VK 解密失败（.keyfile 可能丢失或损坏），请重新配置个人 VK");
+                        tracing::error!(
+                            "VK 解密失败（.keyfile 可能丢失或损坏），请重新配置个人 VK"
+                        );
                     }
                     // Persist with a fresh random nonce (also migrates legacy
                     // plaintext / zero-nonce values to the current format).
                     if needs_reencrypt {
-                        if let Err(e) = save_config(app, &cfg) {
+                        if let Err(e) = save_config(dir, &cfg) {
                             tracing::warn!(error = %e, "failed to re-encrypt secrets");
                         }
                     }
@@ -208,24 +246,24 @@ pub fn load_or_init(app: &tauri::AppHandle) -> AppConfig {
         api_key: Some(generate_api_key()),
         ..AppConfig::default()
     };
-    if let Err(e) = save_config(app, &cfg) {
+    if let Err(e) = save_config(dir, &cfg) {
         tracing::warn!(error = %e, "failed to persist initial config");
     }
     cfg
 }
 
-pub fn save_config(app: &tauri::AppHandle, cfg: &AppConfig) -> Result<(), String> {
-    let path = config_file(app);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("create config dir failed: {e}"))?;
+pub fn save_config(dir: &Path, cfg: &AppConfig) -> Result<(), String> {
+    let path = config_file(dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create config dir failed: {e}"))?;
     }
     // Persist an encrypted copy; the in-memory config keeps plaintext.
     let mut persisted = cfg.clone();
     if let Some(vk) = persisted.user_vk.take() {
-        persisted.user_vk = Some(secret::encrypt(app, &vk)?);
+        persisted.user_vk = Some(secret::encrypt(dir, &vk)?);
     }
     if let Some(mv) = persisted.manual_vk.take() {
-        persisted.manual_vk = Some(secret::encrypt(app, &mv)?);
+        persisted.manual_vk = Some(secret::encrypt(dir, &mv)?);
     }
     let text =
         serde_json::to_string_pretty(&persisted).map_err(|e| format!("serialize config: {e}"))?;
@@ -236,4 +274,75 @@ pub fn save_config(app: &tauri::AppHandle, cfg: &AppConfig) -> Result<(), String
     std::fs::rename(&tmp, &path).map_err(|e| format!("replace config failed: {e}"))?;
     tracing::info!(?path, "config saved");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cfg() -> AppConfig {
+        AppConfig {
+            port: 8266,
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn lan_bind_requires_api_key() {
+        let mut cfg = test_cfg();
+        cfg.bind = "0.0.0.0".into();
+        assert!(validate(&cfg, None).is_err());
+        cfg.api_key = Some("sk-test".into());
+        assert!(validate(&cfg, None).is_ok());
+    }
+
+    #[test]
+    fn zero_port_rejected() {
+        let mut cfg = test_cfg();
+        cfg.port = 0;
+        assert!(validate(&cfg, None).is_err());
+    }
+
+    #[test]
+    fn manual_policy_requires_vks() {
+        let mut cfg = test_cfg();
+        cfg.vk_policy = VkPolicy::Manual;
+        assert!(validate(&cfg, None).is_err());
+        cfg.manual_vk = Some("vk-1,".into());
+        assert!(validate(&cfg, None).is_ok());
+    }
+
+    #[test]
+    fn alias_self_reference_rejected() {
+        let mut cfg = test_cfg();
+        cfg.model_aliases.insert("gpt-4".into(), "gpt-4".into());
+        assert!(validate(&cfg, None).is_err());
+    }
+
+    #[test]
+    fn alias_colliding_with_real_model_rejected() {
+        let mut cfg = test_cfg();
+        cfg.model_aliases.insert("glm-5".into(), "glm-4.7".into());
+        let reg = ModelsRegistry {
+            entries: vec![crate::upstream::ModelEntry {
+                title: "GLM".into(),
+                model: "glm-5".into(),
+                vk: "vk-x".into(),
+                context_length: None,
+                max_tokens: None,
+                builtin: true,
+            }],
+            fetched_at: std::time::SystemTime::now(),
+        };
+        assert!(validate(&cfg, Some(&reg)).is_err());
+        // Without a registry the collision can't be detected — must pass.
+        assert!(validate(&cfg, None).is_ok());
+    }
+
+    #[test]
+    fn manual_vks_parsing() {
+        let mut cfg = test_cfg();
+        cfg.manual_vk = Some(" vk-1 , ,vk-2,".into());
+        assert_eq!(cfg.effective_manual_vks(), vec!["vk-1", "vk-2"]);
+    }
 }

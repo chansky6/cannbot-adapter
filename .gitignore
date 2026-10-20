@@ -5,6 +5,7 @@ dist-ssr
 .DS_Store
 
 # Rust
+/target
 src-tauri/target
 
 # Tauri generated files

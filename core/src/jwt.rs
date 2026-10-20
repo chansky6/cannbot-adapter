@@ -1,13 +1,12 @@
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
 
 use crate::config;
-use crate::state::Shared;
-use crate::tray;
+use crate::state::{self, Shared};
 
 pub const AUTH_URL: &str = "https://cannbot.hicann.cn/cannbot/api/auth/authenticate";
 
-/// Internal JWT state. `token` must never be serialized to the frontend.
+/// Internal JWT state. `token` must never be serialized to a frontend in
+/// full — views should go through [`JwtStatusView`].
 #[derive(Debug, Clone, Default)]
 pub struct JwtState {
     pub token: Option<String>,
@@ -27,7 +26,7 @@ pub fn invalidate(shared: &Shared) {
 }
 
 /// Frontend-safe view of the authentication state.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JwtStatusView {
     pub ok: bool,
     pub message: String,
@@ -73,13 +72,13 @@ pub async fn authenticate(shared: &Shared) -> JwtState {
     };
     if need_save {
         let cfg = shared.config.read().expect("config lock poisoned").clone();
-        let _ = config::save_config(&shared.app, &cfg);
+        let _ = config::save_config(&shared.config_dir, &cfg);
     }
 
     let state = match vk {
         None => JwtState {
             token: None,
-            message: "尚未配置 VK：请在配置页填写个人 VK".to_string(),
+            message: "尚未配置个人 VK：请先设置个人 VK".to_string(),
         },
         Some(vk) => {
             let resp = shared
@@ -109,7 +108,10 @@ pub async fn authenticate(shared: &Shared) -> JwtState {
                     let body = r.text().await.unwrap_or_default();
                     JwtState {
                         token: None,
-                        message: format!("VK 认证失败（{code}）: {}", crate::util::truncate(&body, 200)),
+                        message: format!(
+                            "VK 认证失败（{code}）: {}",
+                            crate::util::truncate(&body, 200)
+                        ),
                     }
                 }
                 Err(e) => JwtState {
@@ -124,7 +126,8 @@ pub async fn authenticate(shared: &Shared) -> JwtState {
     let ok = view.ok;
     *shared.jwt.write().expect("jwt lock poisoned") = state;
     tracing::info!(ok, message = %view.message, "jwt state updated");
-    let _ = shared.app.emit("jwt-status", &view);
-    tray::set_status_tooltip(&shared.app, &view);
+    // The desktop app uses this event to refresh the UI and update its tray
+    // tooltip; the CLI just logs it.
+    state::notify(shared, "jwt-status", &view);
     shared.jwt.read().expect("jwt lock poisoned").clone()
 }

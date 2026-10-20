@@ -11,10 +11,9 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use tauri::Emitter;
 use tokio_util::sync::CancellationToken;
 
-use crate::state::{ServerHandle, Shared};
+use crate::state::{self, ServerHandle, Shared};
 use crate::{jwt, upstream, usage, util};
 
 /// Classifications of upstream failures that drive the VK fallback loop.
@@ -58,10 +57,7 @@ pub async fn send_chat(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let stream = body
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let response = forward_response(shared, resp, model, stream).await;
         Ok(response)
     } else {
@@ -80,8 +76,7 @@ pub async fn send_chat(
 fn is_quota_error(status: u16, body: &str) -> bool {
     let lower = body.to_lowercase();
     status == 429
-        || ((status == 403 || status == 402)
-            && (lower.contains("quota") || body.contains("配额")))
+        || ((status == 403 || status == 402) && (lower.contains("quota") || body.contains("配额")))
 }
 
 /// Max bytes buffered from a response body for usage extraction. The final
@@ -106,7 +101,9 @@ async fn forward_response(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let mut builder = Response::builder().status(status).header("x-adapter", "cannbot");
+    let mut builder = Response::builder()
+        .status(status)
+        .header("x-adapter", "cannbot");
     if let Some(ct) = content_type {
         builder = builder.header("content-type", ct);
     }
@@ -140,7 +137,8 @@ async fn forward_response(
         let body = done_buf.lock().expect("usage tap lock poisoned").clone();
         let shared = done_shared.clone();
         let model = done_model.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        let runtime = shared.runtime.clone();
+        runtime.spawn_blocking(move || {
             usage::record_from_body(&shared, &model, done_stream, &body);
         });
         // Match the upstream stream's item type (reqwest::Error).
@@ -163,8 +161,15 @@ fn truncate(s: &str, max: usize) -> String {
     util::truncate(s, max)
 }
 
-async fn chat_completions(State(shared): State<Shared>, axum::extract::Json(body): axum::extract::Json<Value>) -> Response {
-    let Some(requested_model) = body.get("model").and_then(Value::as_str).map(str::to_string) else {
+async fn chat_completions(
+    State(shared): State<Shared>,
+    axum::extract::Json(body): axum::extract::Json<Value>,
+) -> Response {
+    let Some(requested_model) = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
         return openai_error(StatusCode::BAD_REQUEST, "请求体缺少 `model` 字段");
     };
 
@@ -193,9 +198,9 @@ async fn chat_completions(State(shared): State<Shared>, axum::extract::Json(body
         return openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             if has_vk {
-                "没有可用的虚拟密钥（VK）：请等待模型列表同步，或在配置页检查 VK 策略/手动 VK 设置"
+                "没有可用的虚拟密钥（VK）：请等待模型列表同步，或检查 VK 策略/手动 VK 设置"
             } else {
-                "尚未配置个人 VK：请在配置页「上游凭据」中填写从公司获取的个人 VK"
+                "尚未配置个人 VK：请先设置从公司获取的个人 VK"
             },
         );
     }
@@ -208,10 +213,7 @@ async fn chat_completions(State(shared): State<Shared>, axum::extract::Json(body
             None => match jwt::authenticate(&shared).await.token {
                 Some(t) => t,
                 None => {
-                    return openai_error(
-                        StatusCode::UNAUTHORIZED,
-                        "JWT 未就绪：请检查配置页的 VK 设置",
-                    )
+                    return openai_error(StatusCode::UNAUTHORIZED, "JWT 未就绪：请检查 VK 设置")
                 }
             },
         };
@@ -230,14 +232,17 @@ async fn chat_completions(State(shared): State<Shared>, axum::extract::Json(body
                 if jwt::authenticate(&shared).await.token.is_none() {
                     return openai_error(
                         StatusCode::UNAUTHORIZED,
-                        "VK 重新认证失败，请检查配置页的 VK 设置",
+                        "VK 重新认证失败，请检查 VK 设置",
                     );
                 }
                 tracing::info!("re-authenticated after upstream 401, retrying same VK");
                 continue; // retry same VK with the fresh JWT
             }
             Err(UpstreamError::Quota(msg)) => {
-                tracing::warn!(vk = vk_prefix(&vk), "VK quota issue, falling back to next: {msg}");
+                tracing::warn!(
+                    vk = vk_prefix(&vk),
+                    "VK quota issue, falling back to next: {msg}"
+                );
                 idx += 1;
                 continue;
             }
@@ -305,7 +310,10 @@ async fn vk_candidates(shared: &Shared, real_model: &str) -> Vec<String> {
 async fn list_models(State(shared): State<Shared>) -> Response {
     let registry = shared.models.read().expect("models lock poisoned").clone();
     let Some(reg) = registry else {
-        return openai_error(StatusCode::SERVICE_UNAVAILABLE, "模型列表尚未同步完成，请稍后重试");
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "模型列表尚未同步完成，请稍后重试",
+        );
     };
     let mut ids = reg.model_ids();
     let aliases: Vec<String> = {
@@ -319,9 +327,7 @@ async fn list_models(State(shared): State<Shared>) -> Response {
     }
     let data: Vec<Value> = ids
         .into_iter()
-        .map(|id| {
-            json!({"id": id, "object": "model", "created": 0, "owned_by": "cannbot"})
-        })
+        .map(|id| json!({"id": id, "object": "model", "created": 0, "owned_by": "cannbot"}))
         .collect();
     Json(json!({"object": "list", "data": data})).into_response()
 }
@@ -431,27 +437,35 @@ pub async fn start_server(shared: Shared) -> Result<(), String> {
     let cfg = shared.config.read().expect("config lock poisoned").clone();
     if cfg.bind == "0.0.0.0" && cfg.effective_api_key().is_none() {
         let msg = "监听 0.0.0.0（局域网）时必须设置本地 API Key".to_string();
-        *shared.server_error.write().expect("server error lock poisoned") = Some(msg.clone());
+        *shared
+            .server_error
+            .write()
+            .expect("server error lock poisoned") = Some(msg.clone());
         return Err(msg);
     }
-    let bind = if cfg.bind == "0.0.0.0" { "0.0.0.0" } else { "127.0.0.1" };
+    let bind = if cfg.bind == "0.0.0.0" {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
     let addr = format!("{bind}:{}", cfg.port);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .map_err(|e| {
-            let msg = format!("绑定 {addr} 失败（端口可能被占用）: {e}");
-            *shared.server_error.write().expect("server error lock poisoned") = Some(msg.clone());
-            msg
-        })?;
+    let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
+        let msg = format!("绑定 {addr} 失败（端口可能被占用）: {e}");
+        *shared
+            .server_error
+            .write()
+            .expect("server error lock poisoned") = Some(msg.clone());
+        msg
+    })?;
     let local = listener
         .local_addr()
         .map_err(|e| format!("获取监听地址失败: {e}"))?;
     let app = build_router(shared.clone());
     let cancel = CancellationToken::new();
     let token = cancel.clone();
-    let task = tauri::async_runtime::spawn(async move {
-        let serve =
-            axum::serve(listener, app).with_graceful_shutdown(async move { token.cancelled().await });
+    let task = shared.runtime.spawn(async move {
+        let serve = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { token.cancelled().await });
         if let Err(e) = serve.await {
             tracing::error!(error = %e, "http server stopped with error");
         }
@@ -461,9 +475,13 @@ pub async fn start_server(shared: Shared) -> Result<(), String> {
         cancel,
         task,
     });
-    *shared.server_error.write().expect("server error lock poisoned") = None;
+    *shared
+        .server_error
+        .write()
+        .expect("server error lock poisoned") = None;
     tracing::info!(%local, "http server started");
-    let _ = shared.app.emit(
+    state::notify(
+        &shared,
         "server-status",
         json!({"running": true, "addr": local.to_string(), "error": null}),
     );
@@ -471,11 +489,7 @@ pub async fn start_server(shared: Shared) -> Result<(), String> {
 }
 
 pub async fn stop_server(shared: &Shared) {
-    let stopped = shared
-        .server
-        .write()
-        .expect("server lock poisoned")
-        .take();
+    let stopped = shared.server.write().expect("server lock poisoned").take();
     if let Some(handle) = stopped {
         handle.cancel.cancel();
         // Give graceful shutdown a short window, then force-abort
@@ -483,7 +497,8 @@ pub async fn stop_server(shared: &Shared) {
         tokio::time::sleep(Duration::from_millis(200)).await;
         handle.task.abort();
         tracing::info!("http server stopped");
-        let _ = shared.app.emit(
+        state::notify(
+            shared,
             "server-status",
             json!({"running": false, "addr": null, "error": null}),
         );

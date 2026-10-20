@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use tauri::Emitter;
-
-use crate::state::Shared;
+use crate::state::{self, Shared};
 
 pub const GATEWAY_BASE: &str = "https://cannbot.hicann.cn";
 
@@ -113,12 +111,7 @@ struct CompletionOptions {
 }
 
 pub async fn current_jwt(shared: &Shared) -> Option<String> {
-    shared
-        .jwt
-        .read()
-        .expect("jwt lock poisoned")
-        .token
-        .clone()
+    shared.jwt.read().expect("jwt lock poisoned").token.clone()
 }
 
 /// Fetch the model list from the gateway and build the registry.
@@ -146,7 +139,10 @@ pub async fn fetch_models(shared: &Shared) -> Result<ModelsRegistry, String> {
         .await
         .map_err(|e| format!("读取模型列表响应失败: {e}"))?;
     if !status.is_success() {
-        return Err(format!("模型列表接口返回 {status}: {}", crate::util::truncate(&text, 300)));
+        return Err(format!(
+            "模型列表接口返回 {status}: {}",
+            crate::util::truncate(&text, 300)
+        ));
     }
     let parsed: ModelsApiResp =
         serde_json::from_str(&text).map_err(|e| format!("解析模型列表失败: {e}"))?;
@@ -183,9 +179,11 @@ pub async fn fetch_models(shared: &Shared) -> Result<ModelsRegistry, String> {
     };
     *shared.models.write().expect("models lock poisoned") = Some(registry.clone());
     tracing::info!(count, "models registry refreshed");
-    let _ = shared
-        .app
-        .emit("models-synced", serde_json::json!({ "count": count }));
+    state::notify(
+        shared,
+        "models-synced",
+        serde_json::json!({ "count": count }),
+    );
     Ok(registry)
 }
 
@@ -196,7 +194,8 @@ pub async fn fetch_models(shared: &Shared) -> Result<ModelsRegistry, String> {
 /// iteration re-authenticates (the short retry delay keeps recovery fast).
 pub fn spawn_sync_loop(shared: Shared) {
     const AUTH_FAILED: &str = "auth-failed:";
-    tauri::async_runtime::spawn(async move {
+    let runtime = shared.runtime.clone();
+    runtime.spawn(async move {
         loop {
             if current_jwt(&shared).await.is_none() {
                 let _ = crate::jwt::authenticate(&shared).await;
@@ -205,13 +204,21 @@ pub fn spawn_sync_loop(shared: Shared) {
             if let Err(e) = fetch_models(&shared).await {
                 fetch_failed = true;
                 if let Some(reason) = e.strip_prefix(AUTH_FAILED) {
-                    tracing::warn!(reason, "models fetch rejected our JWT; invalidating and re-authenticating");
+                    tracing::warn!(
+                        reason,
+                        "models fetch rejected our JWT; invalidating and re-authenticating"
+                    );
                     crate::jwt::invalidate(&shared);
                 } else {
                     tracing::warn!(error = %e, "models fetch failed, will retry");
                 }
             }
-            let delay = if shared.models.read().expect("models lock poisoned").is_some() {
+            let delay = if shared
+                .models
+                .read()
+                .expect("models lock poisoned")
+                .is_some()
+            {
                 Duration::from_secs(600)
             } else {
                 Duration::from_secs(30)

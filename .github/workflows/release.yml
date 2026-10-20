@@ -72,6 +72,39 @@ jobs:
 
             - macOS: aarch64 (Apple Silicon) dmg
             - Windows: msi + nsis 安装包
+            - Linux: cannbotcli 命令行版（见 cannbotcli-linux-x86_64.tar.gz，附 cbc 别名）
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  # Linux CLI: pure-Rust binary with no GUI dependencies. Runs after `build`
+  # so the draft release already exists for `gh release upload` to attach to.
+  cli:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Build CLI (release)
+        run: cargo build --release -p cannbot-cli
+
+      - name: Package
+        run: |
+          cd target/release
+          ln -sf cannbotcli cbc
+          tar czf ../../cannbotcli-linux-x86_64.tar.gz cannbotcli cbc
+          cd ../..
+          sha256sum cannbotcli-linux-x86_64.tar.gz > cannbotcli-linux-x86_64.tar.gz.sha256
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            cannbotcli-linux-x86_64.tar.gz \
+            cannbotcli-linux-x86_64.tar.gz.sha256 \
+            --clobber

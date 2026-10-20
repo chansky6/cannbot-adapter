@@ -24,8 +24,8 @@ pub fn init(app: &tauri::AppHandle) {
     // The guard must live for the whole process; leak it deliberately.
     std::mem::forget(guard);
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     // stderr is unbuffered; stdout would silently swallow logs when
     // redirected to a file and the process is killed.
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
@@ -36,4 +36,3 @@ pub fn init(app: &tauri::AppHandle) {
         .with(file_layer)
         .init();
 }
-
