@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "cannbot-adapter"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cannbot-core",
  "serde",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "cannbot-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cannbot-core",
  "clap",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "cannbot-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "axum",
