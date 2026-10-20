@@ -94,10 +94,10 @@ jobs:
 
       - name: Package
         run: |
-          cd target/release
+          cd src-tauri/target/release
           ln -sf cannbotcli cbc
-          tar czf ../../cannbotcli-linux-x86_64.tar.gz cannbotcli cbc
-          cd ../..
+          tar czf "$GITHUB_WORKSPACE/cannbotcli-linux-x86_64.tar.gz" cannbotcli cbc
+          cd "$GITHUB_WORKSPACE"
           sha256sum cannbotcli-linux-x86_64.tar.gz > cannbotcli-linux-x86_64.tar.gz.sha256
 
       - name: Upload to release
